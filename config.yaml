@@ -1,0 +1,105 @@
+# agent-error-generator configuration
+#
+# num_agents: how many Worker agents split the integration interval
+# num_steps:  how many refinement iterations each Worker performs
+#             (step k uses n = initial_n * 2^(k-1) rectangles)
+
+workflow:
+  id: "integration_01"
+  num_agents: 3
+  num_steps: 2
+
+problem:
+  # Polynomial coefficients [a0, a1, a2, ...] -> f(x) = a0 + a1*x + a2*x^2 + ...
+  function:
+    coefficients: [2.0, -1.0, 0.5]   # f(x) = 2 - x + 0.5x^2
+  interval: [0.0, 3.0]
+  initial_n: 10                        # rectangles on step 1; doubles each step
+
+ollama:
+  host: "localhost"
+  port: 11434
+  model: "mistral"   # mistral | granite4 | qwen2.5-coder | gemma4
+  timeout: 300       # seconds per request
+
+cte_proxy:
+  enabled: false
+  host: "localhost"
+  port: 9090
+
+# Error injections -- list of injection specs.
+# Each injection replaces one agent's output with a synthetic erroneous response.
+#
+# Injection timing (when the wrong output is produced):
+#   agent_type   : "planner" | "worker" | "aggregator"
+#   agent_index  : 0-based worker index (omit/null -> applies to all of that type)
+#   inject_step  : 1-based refinement step at which the error fires (default: 1)
+#                  Old "step" field is still accepted as a backward-compat alias.
+#   error_type   : "format" | "logic" | "tool_call"
+#
+# Detection timing (when/where the error becomes visible):
+#   detect_step  : 1-based step at which the error is flagged in errors[].
+#                  Omit or set equal to inject_step for immediate detection (default).
+#                  Must be >= inject_step.
+#   detect_phase : "workers" (default) | "aggregator" | "none"
+#                  workers    -- worker self-reports at detect_step (classic behaviour)
+#                  aggregator -- worker stays silent; coordinator logs detection after
+#                                the aggregator phase completes and adds the record to
+#                                final_report["aggregator_detected_errors"].
+#                  none       -- error is never flagged anywhere (silent propagation).
+#
+# error_type meanings:
+#   format    -- agent returns plain text instead of the required JSON object.
+#   logic     -- agent returns JSON with a wrong result (scale_factor multiplies result)
+#   tool_call -- the compute_riemann tool "fails" with an HTTP-error body (status 404);
+#                the agent returns a plausible but wrong fallback JSON.
+#
+error_injections: []
+
+# --- Example injections (uncomment to activate) ---
+
+# Classic: format error on worker 1, step 1 (immediate detection):
+# error_injections:
+#   - agent_type: "worker"
+#     agent_index: 1
+#     inject_step: 1
+#     error_type: "format"
+
+# Classic: logic error on worker 0, step 2 (result scaled by -1):
+# error_injections:
+#   - agent_type: "worker"
+#     agent_index: 0
+#     inject_step: 2
+#     error_type: "logic"
+#     scale_factor: -1.0
+
+# Deferred (within-worker): logic error fires at step 1, reported at step 3:
+# error_injections:
+#   - agent_type: "worker"
+#     agent_index: 0
+#     inject_step: 1
+#     detect_step: 3
+#     detect_phase: "workers"
+#     error_type: "logic"
+
+# Aggregator-phase: tool_call error fires at step 1, worker stays silent,
+# reported only in final_report after the aggregator runs:
+# error_injections:
+#   - agent_type: "worker"
+#     agent_index: 2
+#     inject_step: 1
+#     detect_phase: "aggregator"
+#     error_type: "tool_call"
+
+# Silent: format error propagates to the final answer without ever being flagged:
+# error_injections:
+#   - agent_type: "worker"
+#     agent_index: 1
+#     inject_step: 1
+#     detect_phase: "none"
+#     error_type: "format"
+
+# Format error on planner (detect_step / detect_phase not applicable to planner):
+# error_injections:
+#   - agent_type: "planner"
+#     error_type: "format"

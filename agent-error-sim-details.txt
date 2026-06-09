@@ -1,0 +1,371 @@
+agent-error-generator — Per-Test Details
+==========================================
+
+Workflow Overview
+-----------------
+The agent-error-generator is a multi-agent simulation framework built around a
+three-phase numerical integration pipeline. Each workflow run begins with a Planner
+agent, which receives a polynomial function and a definite integration interval and
+returns a JSON task list that divides the interval into equal sub-intervals, one per
+worker. A configurable number of Worker agents then run concurrently, each
+responsible for approximating the integral over its assigned sub-interval using the
+midpoint Riemann sum method. Every worker engages in a multi-turn conversation with
+the underlying LLM: in each refinement step the worker first requests a
+compute_riemann tool call (doubling the rectangle count n on each step), receives
+the numerical result, and then reports its partial integral as a JSON object.
+Workers repeat this for a configurable number of steps, stopping early if the
+result converges to within 0.01% of the previous step. Once all workers finish, an
+Aggregator agent collects their partial integrals, sums them, and produces a final
+JSON report containing the total integral, an absolute error, and a convergence
+summary. The coordinator independently recomputes the absolute error from the exact
+analytical integral, overwriting the LLM's self-reported value so the metric is
+always ground-truth. Controlled faults are introduced via an error injection layer
+that intercepts agent responses at precise (role, agent index, step) coordinates
+and substitutes one of three failure types: a format error replaces the required
+JSON output with unstructured prose; a logic error returns valid JSON with the
+integral value scaled by −1 (a sign flip); and a tool-call error replaces the
+compute_riemann result with an HTTP 404 error body, causing the worker to produce a
+plausible but wrong fallback answer. All agent conversations are routed through a
+Context-Event Engine (CEE) Flask proxy, which records every Ollama request and
+response, tracks token deltas, builds a Ctx_graph of interaction events, emits
+recovery events when failures are detected, and auto-generates checkpoints that the
+CEE's rollback planner can use for replay injection. At the end of each run,
+generator.py writes a result.json file containing the workflow ID, timing, exact
+and computed integrals, per-worker step traces, and any injected error labels;
+export_cee_visuals.py then queries the CEE API to produce a combined per-task HTML
+report containing Plotly charts for context growth, latency, token deltas, and the
+full interaction-sequence table for every agent in the workflow.
+
+t01_baseline_qwen
+-----------------
+A clean baseline run using qwen2.5-coder:32b with three worker agents and two
+refinement steps per worker, with no error injections of any kind. Its purpose
+is to establish a reference trace in the Context-Event Engine (CEE) for the qwen
+model: a healthy planner–worker–aggregator workflow produces a ground-truth
+Ctx_graph, a set of auto-checkpoints, and a known-good absolute error against the
+exact Riemann integral. All downstream error-injection tests for qwen are compared
+against this trace to isolate the effect of individual failure modes.
+
+t02_baseline_gemma4
+-------------------
+Identical in structure to t01 but executed under gemma4:27b. Three worker agents
+complete two refinement steps each with no injected faults, producing a clean CEE
+trace for the gemma4 model family. Because gemma4 and qwen2.5-coder differ in
+tokenization, response formatting tendencies, and latency profiles, this separate
+baseline is necessary before any cross-model comparison of failure signatures or
+recovery-event characteristics can be made.
+
+t03_fmt_worker_qwen
+-------------------
+A format-error injection targeting worker 1 at step 1, run under qwen2.5-coder:32b
+with three agents and two steps. Instead of returning the required JSON object with
+its partial integral result, worker 1 returns an unstructured plain-text response.
+The test exercises the CEE's failure detector on the most common real-world LLM
+failure mode — prose where structured output was expected — and verifies that a
+recovery event is emitted and scored correctly for a worker-role session.
+
+t04_logic_worker_qwen
+---------------------
+A logic-error injection targeting worker 0 at step 1, run under qwen2.5-coder:32b
+with three agents and two steps. Worker 0 returns syntactically valid JSON, but its
+reported integral value is scaled by −1 (a sign flip), making the result numerically
+plausible yet arithmetically wrong. This tests the CEE's ability to detect subtle
+semantic failures that pass format validation but produce a ground-truth deviation,
+and to attribute the resulting absolute error to the correct session node in the
+Ctx_graph.
+
+t05_toolcall_worker_qwen
+------------------------
+A tool-call error injection targeting worker 2 at step 1, run under
+qwen2.5-coder:32b with three agents and two steps. The compute_riemann tool returns
+an HTTP 404 error body rather than a valid numerical result, causing worker 2 to
+produce a plausible but incorrect fallback answer in its JSON response. The test
+exercises the CEE's detection of tool-execution failures distinct from pure LLM
+output failures, and verifies that the recovery-event type is correctly tagged as
+a tool-call fault rather than a format or logic fault.
+
+t06_fmt_planner_qwen
+--------------------
+A format-error injection targeting the planner role, run under qwen2.5-coder:32b
+with three agents and two steps. The planner, whose job is to return a structured
+JSON task list partitioning the integration interval across workers, instead returns
+a prose description of its plan. The coordinator falls back to an arithmetic
+partition so the workflow continues, but the CEE records the planner-session
+failure. This is the only test in the suite where the failure originates in the
+planning phase rather than in a worker or aggregator.
+
+t07_fmt_aggregator_qwen
+-----------------------
+A format-error injection targeting the aggregator role, run under qwen2.5-coder:32b
+with three agents and two steps. The aggregator, whose job is to sum worker results
+and return a structured JSON report, instead returns a prose summary. The workflow
+coordinator receives no parseable total integral, so the verified absolute error
+cannot be computed and is recorded as null. The test exercises failure detection for
+the final phase of the pipeline and checks that the CEE correctly closes the
+aggregator session with a recovery event even when downstream scoring is impossible.
+
+t08_logic_aggregator_qwen
+-------------------------
+A logic-error injection targeting the aggregator role, run under qwen2.5-coder:32b
+with three agents and two steps. The aggregator returns valid JSON but with its
+total_integral field scaled by −1, so the reported sum has the correct magnitude but
+the wrong sign. Because the coordinator independently recomputes the absolute error
+from the ground-truth integral, the LLM's self-reported error is overwritten with
+the verified value, making the discrepancy visible in result.json. The test checks
+that the CEE attributes a numeric-consistency failure to the aggregator session
+rather than to any worker.
+
+t09_fmt_worker_gemma4
+---------------------
+Mirrors t03 exactly — a format error on worker 1 at step 1 — but executed under
+gemma4:27b with three agents and two steps. Running the same injection under a
+different model reveals whether gemma4 produces a qualitatively different failure
+signature (e.g., different prose structure, longer unformatted responses, or
+different latency profiles) that the CEE must handle. Comparing the Ctx_graph and
+recovery-event shape from t09 against t03 isolates model-specific formatting
+behaviour from the error-injection mechanism itself.
+
+t10_logic_worker_gemma4
+-----------------------
+Mirrors t04 — a logic error (sign flip) on worker 0 at step 1 — executed under
+gemma4:27b with three agents and two steps. The test exists to determine whether
+gemma4 handles the injected sign flip differently from qwen2.5-coder: for instance,
+whether gemma4 is more or less likely to propagate or detect the arithmetic anomaly
+in subsequent turns, and whether the resulting absolute error recorded in the CEE
+differs in magnitude or attribution.
+
+t11_toolcall_worker_gemma4
+--------------------------
+Mirrors t05 — an HTTP-404 tool-call error on worker 2 at step 1 — executed under
+gemma4:27b with three agents and two steps. By repeating the same tool-execution
+failure under a model with different instruction-following characteristics, the test
+probes whether gemma4's fallback response when a tool returns an error differs from
+qwen's, and whether the CEE's tool-execution failure detection is model-agnostic.
+
+t12_two_errors_qwen
+-------------------
+A multi-error run under qwen2.5-coder:32b with three agents and two steps,
+injecting a format error on worker 0 and a logic error on worker 1, both at step 1.
+Two independent failure events occur simultaneously in separate worker sessions,
+forcing the CEE to emit and attribute two concurrent recovery events without
+cross-contaminating the Ctx_graphs of the two sessions. The test is the simplest
+case of the multi-error group and establishes that the CEE can track more than one
+fault per workflow run.
+
+t13_all_types_qwen
+------------------
+A multi-error run under qwen2.5-coder:32b with three agents and two steps,
+injecting all three error types simultaneously: format on worker 0, logic on
+worker 1, and a tool-call failure on worker 2, all at step 1. Every worker fails in
+a different way in the same step, producing three concurrent recovery events of
+distinct types. The test is the most comprehensive single-step stress test of the
+CEE's failure attribution system and verifies that each error type is independently
+detected and labelled even when they co-occur.
+
+t14_cross_agent_qwen
+--------------------
+A cross-role multi-error run under qwen2.5-coder:32b with three agents and two
+steps, injecting a format error into the planner and a logic error into worker 0.
+Because the planner and worker belong to different pipeline phases, the CEE must
+track failures that span the planning and execution stages of the same workflow.
+The test checks that a planner-phase fault and a worker-phase fault can coexist in
+the Ctx_graph without interfering with each other's recovery-event timelines.
+
+t15_staggered_steps_qwen
+------------------------
+A staggered multi-error run under qwen2.5-coder:32b with three agents and three
+steps, injecting a tool-call error on worker 0 at step 1, a format error on
+worker 1 at step 2, and a logic error on worker 2 at step 3. Each worker fails on a
+different step, producing three recovery events spread across the timeline rather
+than clustered at a single point. The test exercises the CEE's ability to track
+failure events that are temporally separated and to build a Ctx_graph with
+non-overlapping recovery-event windows for each worker session.
+
+t16_two_errors_gemma4
+---------------------
+Mirrors t12 — two simultaneous errors in separate workers — but executed under
+gemma4:27b with three agents and two steps. The injected faults are a format error
+on worker 0 and a tool-call error on worker 2, both at step 1. The test repeats the
+two-fault concurrent scenario under gemma4 to reveal any model-specific differences
+in how simultaneous failure events propagate through the pipeline and are recorded
+in the CEE.
+
+t17_all_types_gemma4
+--------------------
+Mirrors t13 — all three error types injected simultaneously across three workers —
+but executed under gemma4:27b with three agents and two steps. Format on worker 0,
+logic on worker 1, and tool-call on worker 2 all fire at step 1, producing three
+concurrent recovery events under the gemma4 model. Comparing the CEE output from
+t17 against t13 provides a direct model-to-model comparison of how the full
+taxonomy of simultaneous failures is expressed and detected.
+
+t18_scale_min_qwen
+------------------
+A minimal-scale clean run under qwen2.5-coder:32b using only two worker agents and
+a single refinement step, with no error injections. The total session count is four
+(planner + two workers + aggregator), making this the smallest possible workflow the
+CEE must handle. The test verifies that the framework correctly records single-step
+sessions, that the Ctx_graph has the expected shallow structure, and that
+auto-checkpointing and visual export work when the number of sessions is at its
+lower bound.
+
+t19_scale_min_gemma4
+--------------------
+Identical in structure to t18 but executed under gemma4:27b. Two workers, one step,
+no injections. The test establishes that the minimal four-session workflow also
+completes correctly under gemma4 and that the CEE's session management handles a
+small parallel request count without issues specific to the gemma4 model's latency
+or tokenization characteristics.
+
+t20_scale_med_qwen
+------------------
+A medium-scale run under qwen2.5-coder:32b with five worker agents, two refinement
+steps, and a tool-call error injected on worker 2 at step 1. Seven sessions run
+concurrently (planner + five workers + aggregator), stressing the CEE's parallel
+session tracking beyond the three-worker baseline. One worker fails while four
+succeed, so the resulting Ctx_graph contains both healthy and faulted worker
+sessions, allowing the CEE to be evaluated on its ability to distinguish clean from
+failed traces within the same workflow.
+
+t21_scale_med_gemma4
+--------------------
+Mirrors t20 in structure — five workers, two steps, one injected error — but
+executed under gemma4:27b. The injected fault is a format error on worker 3 at
+step 1 rather than a tool-call error, varying both the model and the error type
+relative to t20. The test provides a second medium-scale data point under gemma4
+and checks that the CEE's parallel tracking handles seven concurrent gemma4
+sessions without degradation.
+
+t22_scale_large_gemma4
+----------------------
+The largest-scale test in the suite, run under gemma4:27b with eight worker agents
+and two refinement steps. Ten sessions run concurrently (planner + eight workers +
+aggregator), which is the maximum agent count in the test matrix. Two errors are
+injected at non-adjacent workers: a logic error on worker 3 and a format error on
+worker 7, both at step 1. OLLAMA_NUM_PARALLEL is capped at five to prevent CUDA
+out-of-memory on the GH200 (KV-cache pre-allocation for eight 131,072-token
+contexts exceeds available VRAM), so Ollama queues the excess sessions rather than
+running all eight simultaneously. The test is the primary stress test for CEE
+session management, checkpoint export, and visual generation at scale.
+
+t23_deep_clean_qwen
+-------------------
+A deep-session clean run under qwen2.5-coder:32b with three workers and six
+refinement steps, no error injections. Each worker accumulates approximately 25
+conversation turns (one system message plus four turns per step across six steps),
+driving the CEE's auto-checkpoint thread to produce a dense sequence of restore
+points. The test establishes the baseline Ctx_graph shape and checkpoint density
+for a long clean session, against which mid-session and late-session error
+injections in subsequent tests are compared.
+
+t24_deep_clean_gemma4
+---------------------
+Mirrors t23 — three workers, six steps, no errors — executed under gemma4:27b.
+The deep clean session under gemma4 produces a reference Ctx_graph with the same
+structural depth as t23, allowing checkpoint density and context-diff behaviour to
+be compared across models in the absence of any fault. Differences in the
+Ctx_graphs between t23 and t24 reflect model-level variation in token usage,
+latency, and response length rather than any error-injection effect.
+
+t25_deep_fmt_mid_qwen
+---------------------
+A deep-session run under qwen2.5-coder:32b with three workers and six steps,
+injecting a format error on worker 1 at step 3 of 6. The failure arrives at the
+midpoint of a long session, meaning the worker has already built up a substantial
+Ctx_graph before the fault occurs. The test exercises the CEE's ability to emit a
+recovery event and identify a rollback candidate from the set of prior checkpoints
+when the session is already deep, and to continue recording the remaining steps
+after the fault without corrupting the pre-fault trace.
+
+t26_deep_toolcall_mid_gemma4
+----------------------------
+A deep-session run under gemma4:27b with three workers and six steps, injecting a
+tool-call error on worker 0 at step 4 of 6. The fault occurs slightly past the
+midpoint of the session. Compared to t25, this test uses a different error type
+(tool-call versus format) and a later injection step, probing whether the CEE
+handles tool-execution failures differently from format failures when they occur
+inside a long session. The gemma4 model also provides a cross-model comparison
+against t25's qwen results.
+
+t27_deep_logic_late_qwen
+------------------------
+A deep-session run under qwen2.5-coder:32b with three workers and six steps,
+injecting a logic error on worker 2 at step 5 of 6. The fault occurs near the end
+of the session, when the Ctx_graph is nearly complete. The test checks that a
+late-arriving recovery event is correctly attributed to the right node even after
+five clean steps have been recorded, and that the checkpoint manager can still
+identify a meaningful rollback candidate from the dense restore-point set built up
+during the preceding five steps.
+
+t28_deep_multi_err_gemma4
+-------------------------
+The most structurally complex test in the suite: gemma4:27b with five workers and
+six steps, injecting a logic error on worker 1 at step 3 and a format error on
+worker 3 at step 5. Two faults on two different workers occur at different points in
+a six-step session, producing two temporally separated recovery events within a deep
+Ctx_graph. The combination of five workers, six steps, and two staggered errors
+generates the largest and most intricate session graph of any test, exercising the
+full range of CEE checkpoint-density, failure-attribution, and rollback-plan
+capabilities simultaneously.
+
+t29_ctx_exhaust_clean_qwen
+--------------------------
+A context-exhaustion baseline run under qwen2.5-coder:32b with three workers and
+four steps, with the Ollama context window capped at 2048 tokens and no error
+injections. The small context window causes each worker session to exceed the limit
+around step 4 (system prompt plus accumulated turns), triggering Ollama to return
+stop_reason="length". The CEE detects this as a context_exhausted recovery event,
+builds a rollback plan pointing to the most recent checkpoint before overflow, and
+re-injects the error description into the next request. This test establishes the
+clean-run baseline for the compaction pathway with no competing fault signals.
+
+t30_ctx_exhaust_clean_gemma4
+----------------------------
+Mirrors t29 — three workers, four steps, 2048-token context cap, no injections —
+but executed under gemma4:27b. The test provides a gemma4-specific baseline for the
+context-exhaustion pathway and checks that the CEE's detection of
+stop_reason="length" and the subsequent rollback-plan construction work identically
+under a different model. Differences in when overflow occurs relative to step count
+reflect model-level differences in average tokens per turn.
+
+t31_ctx_exhaust_fmt_qwen
+------------------------
+A context-exhaustion plus format-error run under qwen2.5-coder:32b with three
+workers, four steps, a 2048-token context cap, and a format error injected on
+worker 0 at step 2. Two independent failure paths exist in the same session: the
+format fault fires at step 2 and produces one recovery event, while context
+exhaustion fires around step 4 and produces a second recovery event of a different
+type. The test verifies that the CEE correctly tracks and distinguishes two
+different fault types within a single worker session without conflating their
+recovery-event timelines or rollback candidates.
+
+t32_ctx_exhaust_fmt_gemma4
+--------------------------
+Mirrors t31 — three workers, four steps, 2048-token cap, format error on worker 0
+at step 2 — executed under gemma4:27b. The dual-fault scenario (format error
+followed by context exhaustion) is replicated under gemma4 to determine whether the
+two-event CEE recovery sequence is model-agnostic. Any differences in the ordering
+or shape of recovery events between t31 and t32 reveal model-specific behaviour in
+how format failures interact with context-window management.
+
+t33_ctx_exhaust_toolcall_qwen
+-----------------------------
+A context-exhaustion plus tool-call-error run under qwen2.5-coder:32b with three
+workers, four steps, a 2048-token context cap, and a tool-call error (HTTP 404)
+injected on worker 1 at step 1. The tool-call fault fires earliest in the session
+timeline, followed by context exhaustion several steps later, producing two
+recovery events of distinct types — HTTP-error and context-exhausted — attributed
+to the same worker session. The test verifies that the CEE correctly labels both
+event types and builds separate rollback plans for each fault in a session where the
+compaction pathway and the tool-execution failure pathway are both active.
+
+t34_ctx_exhaust_scale_gemma4
+----------------------------
+A context-exhaustion scale-out run under gemma4:27b with five workers, four steps,
+a 2048-token context cap, and a logic error injected on worker 2 at step 2. The
+larger worker count (seven sessions total) combined with the small context window
+means that multiple sessions exhaust their context in roughly the same timeframe,
+producing a fan-out of concurrent context_exhausted recovery events that the CEE
+must process in parallel. The additional logic error on worker 2 adds a second,
+distinct failure signal to the mix, making this the broadest stress test of the
+compaction pathway in the suite.

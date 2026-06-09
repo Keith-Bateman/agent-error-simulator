@@ -1,0 +1,405 @@
+# tests/test_matrix.yaml
+# ──────────────────────────────────────────────────────────────────────────────
+# Consolidated test matrix for the agent-error-generator.
+#
+# Usage
+# ─────
+#   python tests/submit_matrix.py              # submit everything
+#   python tests/submit_matrix.py A B K        # submit specific groups
+#   python tests/submit_matrix.py --dry-run    # print sbatch commands
+#   python tests/submit_matrix.py --list       # one-line summary of all jobs
+#
+# Design principles
+# ─────────────────
+# 1. Worker-agnostic injection: worker inject specs omit agent_index.
+#    submit_matrix.py auto-assigns indices 0, 1, 2, … (mod num_agents) in the
+#    order they appear in the inject list.  This removes the arbitrary
+#    "format on worker 1 but logic on worker 0" choices from the old scripts.
+#
+# 2. Scaling via agent_counts: each scenario may specify a list of worker
+#    counts to run with.  One SLURM job is submitted per count value.
+#    Defaults to [3] when not specified.
+#
+# 3. Model arrays: specify multiple models to compare; one job per model.
+#
+# 4. Inheritance: scenario values override group values, which override
+#    defaults.  extra_args is *additive* (group prefix + scenario suffix).
+#
+# Note: scaling-study and multi-GPU scripts (submit_scaling_repeated.sh,
+#       submit_scaling_multigpu.sh) are already parametric and are kept
+#       as-is outside this matrix.
+# ──────────────────────────────────────────────────────────────────────────────
+
+# ── Model registry ────────────────────────────────────────────────────────────
+models:
+  qwen:
+    script: slurm_aeg_qwen25coder.sh
+    label: "qwen2.5-coder:32b"
+  gemma4:
+    script: slurm_aeg_gemma4.sh
+    label: "gemma4:27b"
+  mistral:
+    script: slurm_aeg_mistral.sh
+    label: "mistral:latest"
+  granite4:
+    script: slurm_aeg_granite4.sh
+    label: "granite4:latest"
+
+# ── Global defaults ───────────────────────────────────────────────────────────
+defaults:
+  num_steps:    3
+  agent_counts: [3]
+  models:       [qwen]
+  # extra_args: ""   (none by default)
+
+# ── Test groups ───────────────────────────────────────────────────────────────
+groups:
+
+  # ── A: Baseline ─────────────────────────────────────────────────────────────
+  # Clean reference run; no errors injected.
+  # All four models run to establish per-model performance baselines.
+  - id: A
+    label: "Baseline — no errors"
+    num_steps: 2
+    models: [qwen, gemma4, mistral, granite4]
+    scenarios:
+      - id: baseline
+        inject: []
+
+  # ── B: Error-type variety ────────────────────────────────────────────────────
+  # One scenario per error type, per agent role.
+  # Replaces: Groups B (qwen, t03-t08) and C (gemma4, t09-t11) combined.
+  # Worker errors run on all four models; planner/aggregator errors on qwen only.
+  - id: B
+    label: "Error-type variety"
+    num_steps: 2
+    models: [qwen, gemma4, mistral, granite4]
+    scenarios:
+      # Worker errors — all four models
+      - id: fmt_worker
+        inject:
+          - {error_type: format, agent_type: worker, inject_step: 1}
+      - id: logic_worker
+        inject:
+          - {error_type: logic, agent_type: worker, inject_step: 1}
+      - id: toolcall_worker
+        inject:
+          - {error_type: tool_call, agent_type: worker, inject_step: 1}
+      # Planner / aggregator errors — qwen only
+      - id: fmt_planner
+        models: [qwen]
+        inject:
+          - {error_type: format, agent_type: planner}
+      - id: fmt_aggregator
+        models: [qwen]
+        inject:
+          - {error_type: format, agent_type: aggregator}
+      - id: logic_aggregator
+        models: [qwen]
+        inject:
+          - {error_type: logic, agent_type: aggregator}
+
+  # ── D: Multiple simultaneous errors ──────────────────────────────────────────
+  # Replaces: Groups D (qwen, t12-t15) and E (gemma4, t16-t17) combined.
+  - id: D
+    label: "Multiple simultaneous errors"
+    num_steps: 2
+    models: [qwen, gemma4, mistral, granite4]
+    scenarios:
+      # Two different error types on two different workers (sequential assignment)
+      - id: two_worker_errors
+        inject:
+          - {error_type: format,    agent_type: worker, inject_step: 1}
+          - {error_type: logic,     agent_type: worker, inject_step: 1}
+      # All three error types, one per worker
+      - id: all_three_types
+        inject:
+          - {error_type: format,    agent_type: worker, inject_step: 1}
+          - {error_type: logic,     agent_type: worker, inject_step: 1}
+          - {error_type: tool_call, agent_type: worker, inject_step: 1}
+      # Cross-agent: planner format + worker logic
+      - id: cross_agent
+        inject:
+          - {error_type: format, agent_type: planner}
+          - {error_type: logic,  agent_type: worker, inject_step: 1}
+      # Staggered steps: each worker fails at a different step
+      - id: staggered_steps
+        num_steps: 3
+        inject:
+          - {error_type: tool_call, agent_type: worker, inject_step: 1}
+          - {error_type: format,    agent_type: worker, inject_step: 2}
+          - {error_type: logic,     agent_type: worker, inject_step: 3}
+
+  # ── F: Scale — minimal ───────────────────────────────────────────────────────
+  # Replaces: t18_scale_min_qwen, t19_scale_min_gemma4
+  - id: F
+    label: "Scale — minimal (2 workers, 1 step)"
+    agent_counts: [2]
+    num_steps: 1
+    models: [qwen, gemma4, mistral, granite4]
+    scenarios:
+      - id: scale_min
+        inject: []
+
+  # ── G: Scale — medium ───────────────────────────────────────────────────────
+  # Replaces: t20_scale_med_qwen, t21_scale_med_gemma4
+  - id: G
+    label: "Scale — medium (5 workers)"
+    agent_counts: [5]
+    num_steps: 2
+    models: [qwen, gemma4, mistral, granite4]
+    scenarios:
+      - id: scale_med
+        inject:
+          - {error_type: tool_call, agent_type: worker, inject_step: 1}
+
+  # ── H: Scale — large ────────────────────────────────────────────────────────
+  # Replaces: t22_scale_large_gemma4.
+  # Two errors on the first two workers (was workers 3 and 7 — arbitrary).
+  - id: H
+    label: "Scale — large (8 workers, gemma4 only)"
+    agent_counts: [8]
+    num_steps: 2
+    models: [gemma4]
+    scenarios:
+      - id: scale_large
+        inject:
+          - {error_type: logic,  agent_type: worker, inject_step: 1}
+          - {error_type: format, agent_type: worker, inject_step: 1}
+
+  # ── I: Deep sessions (context compaction) ────────────────────────────────────
+  # Replaces: t23-t28 (Group I)
+  - id: I
+    label: "Context compaction — deep sessions (6 steps)"
+    agent_counts: [3]
+    num_steps: 6
+    models: [qwen, gemma4, mistral, granite4]
+    scenarios:
+      - id: deep_clean
+        inject: []
+      - id: deep_fmt_mid
+        inject:
+          - {error_type: format, agent_type: worker, inject_step: 3}
+      - id: deep_toolcall_mid
+        inject:
+          - {error_type: tool_call, agent_type: worker, inject_step: 4}
+      - id: deep_logic_late
+        inject:
+          - {error_type: logic, agent_type: worker, inject_step: 5}
+      - id: deep_multi_err
+        agent_counts: [5]
+        inject:
+          - {error_type: logic,  agent_type: worker, inject_step: 3}
+          - {error_type: format, agent_type: worker, inject_step: 5}
+
+  # ── J: Context exhaustion ───────────────────────────────────────────────────
+  # Replaces: t29-t34 (Group J, num_ctx=2048) and t35-t38 (ctx512 script).
+  # Both context-window sizes in one group to keep exhaustion tests together.
+  - id: J
+    label: "Context exhaustion"
+    agent_counts: [3]
+    num_steps: 4
+    models: [qwen, gemma4, mistral, granite4]
+    scenarios:
+      # 2048-token window: exhaustion around step 4
+      - id: ctx2048_clean
+        extra_args: "--num-ctx 2048"
+        inject: []
+      - id: ctx2048_fmt
+        extra_args: "--num-ctx 2048"
+        inject:
+          - {error_type: format, agent_type: worker, inject_step: 2}
+      - id: ctx2048_toolcall
+        extra_args: "--num-ctx 2048"
+        inject:
+          - {error_type: tool_call, agent_type: worker, inject_step: 1}
+      - id: ctx2048_scale
+        extra_args: "--num-ctx 2048"
+        agent_counts: [5]
+        inject:
+          - {error_type: logic, agent_type: worker, inject_step: 2}
+
+      # 512-token window: aggressive exhaustion around step 3; use 6 steps to
+      # accumulate multiple exhaustion events per session.
+      - id: ctx512_clean
+        extra_args: "--num-ctx 512"
+        num_steps: 6
+        inject: []
+      - id: ctx512_fmt
+        extra_args: "--num-ctx 512"
+        num_steps: 6
+        inject:
+          - {error_type: format, agent_type: worker, inject_step: 2}
+      - id: ctx512_toolcall
+        extra_args: "--num-ctx 512"
+        num_steps: 6
+        inject:
+          - {error_type: tool_call, agent_type: worker, inject_step: 1}
+
+  # ── L: Explicit context compaction (max-turns) ───────────────────────────────
+  # Replaces: t39-t42 (submit_compact.sh)
+  - id: L
+    label: "Explicit context compaction (--max-turns 1, 6 steps)"
+    agent_counts: [3]
+    num_steps: 6
+    extra_args: "--max-turns 1"
+    models: [qwen, gemma4, mistral, granite4]
+    scenarios:
+      - id: compact_clean
+        inject: []
+      - id: compact_fmt
+        inject:
+          - {error_type: format, agent_type: worker, inject_step: 2}
+      - id: compact_logic
+        inject:
+          - {error_type: logic, agent_type: worker, inject_step: 3}
+
+  # ── K: Deferred detection ────────────────────────────────────────────────────
+  # Replaces: submit_deferred.sh (t50-t74).
+  # Tests the inject_step / detect_step / detect_phase mechanism.
+  #
+  # Subgroup K1 — single-step detection lag (detect_step = inject_step + 1)
+  # Subgroup K2 — multi-step detection lag (detect_step = inject_step + 2 or 3)
+  # Subgroup K3 — aggregator-phase detection (worker stays silent)
+  # Subgroup K4 — silent propagation (detect_phase: none)
+  # Subgroup K5 — pairwise comparison benchmarks (detection mode is the only variable)
+  - id: K
+    label: "Deferred detection"
+    agent_counts: [3]
+    num_steps: 4
+    models: [qwen]
+    scenarios:
+
+      # ── K1: single-step lag ──────────────────────────────────────────────
+      # Inject at step 1; report in errors[] only at step 2 (lag = 1).
+      - id: lag1_logic
+        models: [qwen, gemma4, mistral, granite4]
+        inject:
+          - {error_type: logic, agent_type: worker,
+             inject_step: 1, detect_step: 2, detect_phase: workers}
+      - id: lag1_toolcall
+        inject:
+          - {error_type: tool_call, agent_type: worker,
+             inject_step: 1, detect_step: 2, detect_phase: workers}
+      - id: lag1_format
+        inject:
+          - {error_type: format, agent_type: worker,
+             inject_step: 1, detect_step: 2, detect_phase: workers}
+
+      # ── K2: multi-step lag ───────────────────────────────────────────────
+      - id: lag2_logic
+        models: [qwen, gemma4, mistral, granite4]
+        inject:
+          - {error_type: logic, agent_type: worker,
+             inject_step: 1, detect_step: 3, detect_phase: workers}
+      # lag = 3: detect_step equals last step; fires at run end
+      - id: lag3_logic
+        inject:
+          - {error_type: logic, agent_type: worker,
+             inject_step: 1, detect_step: 4, detect_phase: workers}
+      # Two workers, different lags simultaneously
+      - id: multi_lag
+        inject:
+          - {error_type: tool_call, agent_type: worker,
+             inject_step: 1, detect_step: 2, detect_phase: workers}
+          - {error_type: format,    agent_type: worker,
+             inject_step: 2, detect_step: 4, detect_phase: workers}
+      # Deep session: inject at step 2, detect at step 5 (lag = 3, 6 steps total)
+      - id: deep_lag3
+        num_steps: 6
+        inject:
+          - {error_type: logic, agent_type: worker,
+             inject_step: 2, detect_step: 5, detect_phase: workers}
+      # detect_step beyond num_steps: drain fires at run end with annotation
+      - id: detect_beyond_end
+        inject:
+          - {error_type: logic, agent_type: worker,
+             inject_step: 1, detect_step: 8, detect_phase: workers}
+
+      # ── K3: aggregator-phase detection ───────────────────────────────────
+      # Worker stays silent; coordinator adds detection record to final_report.
+      - id: agg_logic
+        num_steps: 3
+        models: [qwen, gemma4, mistral, granite4]
+        inject:
+          - {error_type: logic, agent_type: worker,
+             inject_step: 1, detect_phase: aggregator}
+      - id: agg_toolcall
+        num_steps: 3
+        inject:
+          - {error_type: tool_call, agent_type: worker,
+             inject_step: 1, detect_phase: aggregator}
+      # Two workers both silently pass errors to the aggregator
+      - id: agg_two_workers
+        num_steps: 3
+        inject:
+          - {error_type: logic,  agent_type: worker,
+             inject_step: 1, detect_phase: aggregator}
+          - {error_type: format, agent_type: worker,
+             inject_step: 1, detect_phase: aggregator}
+      # Mixed: one immediate + one aggregator-phase detection
+      - id: agg_mixed
+        num_steps: 3
+        inject:
+          - {error_type: logic,     agent_type: worker, inject_step: 1}
+          - {error_type: tool_call, agent_type: worker,
+             inject_step: 1, detect_phase: aggregator}
+
+      # ── K4: silent propagation ───────────────────────────────────────────
+      # detect_phase: none — error never flagged; wrong value reaches final answer.
+      - id: silent_logic
+        num_steps: 3
+        models: [qwen, gemma4, mistral, granite4]
+        inject:
+          - {error_type: logic, agent_type: worker,
+             inject_step: 1, detect_phase: none}
+      - id: silent_format
+        num_steps: 3
+        inject:
+          - {error_type: format, agent_type: worker,
+             inject_step: 1, detect_phase: none}
+      - id: silent_two_workers
+        num_steps: 3
+        inject:
+          - {error_type: logic, agent_type: worker,
+             inject_step: 1, detect_phase: none}
+          - {error_type: logic, agent_type: worker,
+             inject_step: 1, detect_phase: none}
+
+      # ── K5: pairwise comparison benchmarks ──────────────────────────────
+      # Pairs (or trios) where only the detection mode differs.
+      # The immediate-detection counterparts from Group B serve as baselines:
+      #   - B:logic_worker_qwen  →  K5:cmp_immediate (inject_step=2)
+      #   - B:toolcall_worker_gemma4  →  K5:cmp_toolcall_imm
+
+      # Logic error at step 2, immediate vs 2-step deferred
+      - id: cmp_immediate
+        inject:
+          - {error_type: logic, agent_type: worker, inject_step: 2}
+      - id: cmp_lag2
+        inject:
+          - {error_type: logic, agent_type: worker,
+             inject_step: 2, detect_step: 4, detect_phase: workers}
+
+      # Tool-call error at step 1, immediate vs aggregator-phase (gemma4)
+      - id: cmp_toolcall_imm
+        models: [gemma4]
+        num_steps: 3
+        inject:
+          - {error_type: tool_call, agent_type: worker, inject_step: 1}
+      - id: cmp_toolcall_agg
+        models: [gemma4]
+        num_steps: 3
+        inject:
+          - {error_type: tool_call, agent_type: worker,
+             inject_step: 1, detect_phase: aggregator}
+
+      # Three-way: immediate (see B:logic_worker_qwen) / lag-2 / silent
+      - id: cmp3_lag2
+        inject:
+          - {error_type: logic, agent_type: worker,
+             inject_step: 1, detect_step: 3, detect_phase: workers}
+      - id: cmp3_silent
+        inject:
+          - {error_type: logic, agent_type: worker,
+             inject_step: 1, detect_phase: none}
